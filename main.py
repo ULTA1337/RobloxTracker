@@ -19,15 +19,19 @@ def run_web_server():
     app.run(host="0.0.0.0", port=port)
 
 
-# Настройки берутся из Render Environment
+# Настройки из Render Environment
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "15"))
 
-# Roblox User ID отслеживаемых аккаунтов
 TRACKED_USERS = {
     "FixPlay": 734375793,
     "Kaban": 5390379061,
+}
+
+# Открытый инвентарь есть только у FixPlay
+OPEN_INVENTORY_USERS = {
+    734375793: "FixPlay"
 }
 
 logging.basicConfig(
@@ -37,13 +41,15 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 http = requests.Session()
+http.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+})
 
 NAMES_BY_ID = {
     user_id: name
     for name, user_id in TRACKED_USERS.items()
 }
 
-# Состояние каждого аккаунта хранится отдельно.
 last_state = {
     user_id: {
         "is_playing": False,
@@ -51,6 +57,12 @@ last_state = {
         "game_id": None,
     }
     for user_id in TRACKED_USERS.values()
+}
+
+# Хранение ID последнего известного геймпаса (чтобы не присылать старые покупки)
+last_known_pass = {
+    user_id: None
+    for user_id in OPEN_INVENTORY_USERS
 }
 
 
@@ -84,6 +96,69 @@ def send_telegram_message(text, chat_id=None):
         return False
 
 
+def get_latest_gamepass_id(user_id):
+    """Запрашивает последний купленный геймпас из инвентаря (тип 34)."""
+    try:
+        url = f"https://inventory.roblox.com/v2/users/{user_id}/inventory/34?limit=1&sortOrder=Desc"
+        response = http.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json().get("data", [])
+
+        if data:
+            return data[0].get("assetId")
+
+    except requests.RequestException as error:
+        logger.error("Ошибка запроса инвентаря %s: %s", user_id, error)
+
+    return None
+
+
+def get_gamepass_info(pass_id):
+    """Вытягивает название паса и Place ID (TargetId) игры."""
+    try:
+        url = f"https://apis.roblox.com/game-passes/v1/game-passes/{pass_id}/product-info"
+        response = http.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        return {
+            "name": data.get("Name", "Неизвестный пас"),
+            "place_id": data.get("TargetId"),
+        }
+
+    except requests.RequestException as error:
+        logger.error("Ошибка получения информации о пасе %s: %s", pass_id, error)
+
+    return None
+
+
+def check_new_purchases(user_id):
+    """Проверяет появление НОВОГО геймпаса."""
+    current_pass_id = get_latest_gamepass_id(user_id)
+
+    if not current_pass_id:
+        return None
+
+    # При первом запуске просто запоминаем текущий пас, чтобы не спамить прошлыми
+    if last_known_pass[user_id] is None:
+        last_known_pass[user_id] = current_pass_id
+        return None
+
+    # Если появился совершенно новый ID паса
+    if current_pass_id != last_known_pass[user_id]:
+        last_known_pass[user_id] = current_pass_id
+        info = get_gamepass_info(current_pass_id)
+
+        if info:
+            return {
+                "pass_id": current_pass_id,
+                "pass_name": info["name"],
+                "place_id": info["place_id"],
+            }
+
+    return None
+
+
 def get_roblox_presences():
     response = http.post(
         "https://presence.roblox.com/v1/presence/users",
@@ -94,16 +169,11 @@ def get_roblox_presences():
     )
 
     response.raise_for_status()
-
     data = response.json()
-    presences = data.get("userPresences", [])
-
-    logger.info("Ответ Roblox Presence API: %s", presences)
-
-    return presences
+    return data.get("userPresences", [])
 
 
-def make_join_link(place_id, game_id):
+def make_join_link(place_id, game_id=None):
     if game_id and place_id:
         return (
             "https://www.roblox.com/games/start"
@@ -113,7 +183,7 @@ def make_join_link(place_id, game_id):
     if place_id:
         return f"https://www.roblox.com/games/{place_id}"
 
-    return "Roblox не передал ссылку на игру"
+    return "Ссылка недоступна"
 
 
 def update_user_state(presence):
@@ -126,18 +196,13 @@ def update_user_state(presence):
     place_id = presence.get("placeId")
     game_id = presence.get("gameId")
 
-    # Значение 2 означает, что аккаунт находится именно в игре.
-    # placeId может быть None, поэтому он не используется
-    # как обязательное условие.
     is_playing = presence_type == 2
-
     old_state = last_state[user_id]
 
     was_playing = old_state["is_playing"]
     old_game_id = old_state["game_id"]
 
     entered_game = is_playing and not was_playing
-
     changed_server = (
         is_playing
         and was_playing
@@ -147,7 +212,7 @@ def update_user_state(presence):
 
     last_state[user_id] = {
         "is_playing": is_playing,
-        "place_id": place_id if is_playing else None,
+        "place_id": place_id if is_playing else old_state["place_id"],
         "game_id": game_id if is_playing else None,
     }
 
@@ -160,151 +225,82 @@ def update_user_state(presence):
     }
 
 
-def send_game_notification(result):
-    if not result:
-        return
-
-    if not result["entered_game"] and not result["changed_server"]:
-        return
-
-    user_id = result["user_id"]
-    name = result["name"]
-    state = last_state[user_id]
-
-    if result["entered_game"]:
-        title = f"🚨 {name} ЗАШЁЛ В ИГРУ!"
-    else:
-        title = f"🔄 {name} СМЕНИЛ СЕРВЕР!"
-
-    place_id = state["place_id"]
-    game_id = state["game_id"]
-    link = make_join_link(place_id, game_id)
-
-    message = (
-        f"{title}\n\n"
-        f"🎮 Place ID: {place_id or 'Roblox не передал'}\n"
-        f"🖥 Server ID: {game_id or 'Roblox не передал'}\n\n"
-        f"🔗 Попробовать зайти:\n{link}"
-    )
-
-    send_telegram_message(message)
-
-
 def tracker_loop():
-    logger.info("Отслеживание FixPlay и Kaban запущено")
+    logger.info("Отслеживание FixPlay и Kaban запущенно")
 
-    # Первичная проверка без уведомлений.
+    # Первичная инициализация состояния и геймпасов
     try:
         presences = get_roblox_presences()
-
         for presence in presences:
-            user_id = presence.get("userId")
+            uid = presence.get("userId")
+            if uid in last_state:
+                last_state[uid]["is_playing"] = presence.get("userPresenceType") == 2
 
-            if user_id in last_state:
-                presence_type = presence.get("userPresenceType")
-                place_id = presence.get("placeId")
-                game_id = presence.get("gameId")
+        for uid in OPEN_INVENTORY_USERS:
+            last_known_pass[uid] = get_latest_gamepass_id(uid)
 
-                last_state[user_id] = {
-                    "is_playing": presence_type == 2,
-                    "place_id": place_id if presence_type == 2 else None,
-                    "game_id": game_id if presence_type == 2 else None,
-                }
-
-    except (requests.RequestException, ValueError, KeyError) as error:
-        logger.error("Ошибка первой проверки Roblox: %s", error)
+    except Exception as error:
+        logger.error("Ошибка при стартовой инициализации: %s", error)
 
     while True:
         try:
             presences = get_roblox_presences()
-            received_ids = set()
 
             for presence in presences:
                 user_id = presence.get("userId")
-
                 if user_id not in last_state:
                     continue
 
-                received_ids.add(user_id)
-
                 result = update_user_state(presence)
-                send_game_notification(result)
 
-            # Если Roblox временно не вернул пользователя,
-            # не меняем его состояние и не отправляем ложное уведомление.
-            missing_ids = set(last_state.keys()) - received_ids
+                # 1. Уведомление о входе/смене сервера
+                if result and (result["entered_game"] or result["changed_server"]):
+                    name = result["name"]
+                    title = "🚨 ЗАШЁЛ В ИГРУ!" if result["entered_game"] else "🔄 СМЕНИЛ СЕРВЕР!"
+                    p_id = last_state[user_id]["place_id"]
+                    g_id = last_state[user_id]["game_id"]
 
-            if missing_ids:
-                logger.warning(
-                    "Roblox не вернул пользователей: %s",
-                    [
-                        NAMES_BY_ID[user_id]
-                        for user_id in missing_ids
-                    ],
-                )
+                    msg = (
+                        f"{title} ({name})\n\n"
+                        f"🎮 Place ID: {p_id or 'Скрыто (Friends Only)'}\n"
+                        f"🖥 Server ID: {g_id or 'Скрыто'}\n\n"
+                        f"🔗 Ссылка: {make_join_link(p_id, g_id)}"
+                    )
+                    send_telegram_message(msg)
+
+                # 2. Проверка покупки геймпаса (для FixPlay)
+                if user_id in OPEN_INVENTORY_USERS and last_state[user_id]["is_playing"]:
+                    new_purchase = check_new_purchases(user_id)
+
+                    if new_purchase:
+                        p_id = new_purchase["place_id"]
+                        last_state[user_id]["place_id"] = p_id  # Запоминаем открытый Place ID
+                        pass_name = new_purchase["pass_name"]
+                        name = NAMES_BY_ID[user_id]
+
+                        msg = (
+                            f"🛒 {name} КУПИЛ ГЕЙМПАС!\n\n"
+                            f"📦 Название: {pass_name}\n"
+                            f"🎮 Вычисленный Place ID: {p_id}\n\n"
+                            f"🔗 Ссылка на плейс:\n{make_join_link(p_id)}"
+                        )
+                        send_telegram_message(msg)
 
         except (requests.RequestException, ValueError, KeyError) as error:
-            logger.error("Ошибка проверки Roblox: %s", error)
+            logger.error("Ошибка в основном цикле: %s", error)
 
         time.sleep(CHECK_INTERVAL)
 
 
-def get_status_text():
-    lines = ["📡 Текущий статус:"]
-
-    for name, user_id in TRACKED_USERS.items():
-        state = last_state[user_id]
-
-        if state["is_playing"]:
-            lines.append(
-                f"✅ {name} сейчас в игре\n"
-                f"🎮 Place ID: {state['place_id'] or 'не передан'}"
-            )
-        else:
-            lines.append(
-                f"⚪ {name} сейчас не в игре"
-            )
-
-    return "\n\n".join(lines)
-
-
-def refresh_all_states():
-    try:
-        presences = get_roblox_presences()
-
-        for presence in presences:
-            user_id = presence.get("userId")
-
-            if user_id in last_state:
-                presence_type = presence.get("userPresenceType")
-                place_id = presence.get("placeId")
-                game_id = presence.get("gameId")
-
-                last_state[user_id] = {
-                    "is_playing": presence_type == 2,
-                    "place_id": place_id if presence_type == 2 else None,
-                    "game_id": game_id if presence_type == 2 else None,
-                }
-
-    except (requests.RequestException, ValueError, KeyError) as error:
-        logger.error("Ошибка обновления статуса: %s", error)
-
-
 def telegram_commands_loop():
-    logger.info("Команды Telegram запущены")
-
     if not BOT_TOKEN:
-        logger.error("Команды отключены: BOT_TOKEN не задан")
         return
 
     update_offset = None
 
     while True:
         try:
-            params = {
-                "timeout": 25,
-            }
-
+            params = {"timeout": 25}
             if update_offset is not None:
                 params["offset"] = update_offset
 
@@ -313,57 +309,34 @@ def telegram_commands_loop():
                 params=params,
                 timeout=35,
             )
-
             response.raise_for_status()
-
             updates = response.json().get("result", [])
 
             for update in updates:
                 update_offset = update["update_id"] + 1
-
                 message = update.get("message", {})
-                chat = message.get("chat", {})
-                chat_id = chat.get("id")
+                chat_id = message.get("chat", {}).get("id")
                 text = (message.get("text") or "").strip().lower()
 
-                if not chat_id:
-                    continue
+                if chat_id and (text.startswith("/start") or text.startswith("/status")):
+                    lines = ["📡 Статус ютуберов:"]
+                    for uid, name in NAMES_BY_ID.items():
+                        st = last_state[uid]
+                        if st["is_playing"]:
+                            lines.append(
+                                f"✅ {name} в игре\n🎮 Place ID: {st['place_id'] or 'скрыто'}"
+                            )
+                        else:
+                            lines.append(f"⚪ {name} не в игре")
 
-                if text.startswith("/start") or text.startswith("/status"):
-                    # Для команды делаем свежий запрос Roblox.
-                    refresh_all_states()
+                    send_telegram_message("\n\n".join(lines), chat_id=chat_id)
 
-                    answer = (
-                        "✅ Да, бот работает!\n\n"
-                        f"{get_status_text()}\n\n"
-                        "Уведомления отправляются отдельно для каждого аккаунта.\n"
-                        "Сообщение приходит только при нахождении аккаунта "
-                        "именно внутри Roblox-игры."
-                    )
-
-                    send_telegram_message(
-                        answer,
-                        chat_id=chat_id,
-                    )
-
-        except requests.RequestException as error:
-            logger.error("Ошибка получения команд Telegram: %s", error)
-            time.sleep(5)
-
-        except (ValueError, KeyError) as error:
-            logger.error("Ошибка обработки Telegram: %s", error)
+        except Exception as error:
+            logger.error("Ошибка Telegram команд: %s", error)
             time.sleep(5)
 
 
 if __name__ == "__main__":
-    threading.Thread(
-        target=tracker_loop,
-        daemon=True,
-    ).start()
-
-    threading.Thread(
-        target=telegram_commands_loop,
-        daemon=True,
-    ).start()
-
+    threading.Thread(target=tracker_loop, daemon=True).start()
+    threading.Thread(target=telegram_commands_loop, daemon=True).start()
     run_web_server()

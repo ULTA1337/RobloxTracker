@@ -19,7 +19,7 @@ def run_web_server():
     app.run(host="0.0.0.0", port=port)
 
 
-# Настройки из Render Environment
+# Настройки берутся из переменного окружения Render
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "15"))
@@ -29,7 +29,7 @@ TRACKED_USERS = {
     "Kaban": 5390379061,
 }
 
-# Открытый инвентарь есть только у FixPlay
+# Открытый инвентарь отслеживаем только у FixPlay
 OPEN_INVENTORY_USERS = {
     734375793: "FixPlay"
 }
@@ -59,7 +59,7 @@ last_state = {
     for user_id in TRACKED_USERS.values()
 }
 
-# Хранение ID последнего известного геймпаса (чтобы не присылать старые покупки)
+# Хранение ID последнего известного геймпаса
 last_known_pass = {
     user_id: None
     for user_id in OPEN_INVENTORY_USERS
@@ -86,7 +86,6 @@ def send_telegram_message(text, chat_id=None):
             },
             timeout=10,
         )
-
         response.raise_for_status()
         logger.info("Сообщение Telegram отправлено")
         return True
@@ -97,9 +96,9 @@ def send_telegram_message(text, chat_id=None):
 
 
 def get_latest_gamepass_id(user_id):
-    """Запрашивает последний купленный геймпас из инвентаря (тип 34)."""
     try:
-        url = f"https://inventory.roblox.com/v2/users/{user_id}/inventory/34?limit=1&sortOrder=Desc"
+        # Strict limit=10 for Roblox V2 Inventory API
+        url = f"https://inventory.roblox.com/v2/users/{user_id}/inventory/34?limit=10&sortOrder=Desc"
         response = http.get(url, timeout=10)
         response.raise_for_status()
         data = response.json().get("data", [])
@@ -114,7 +113,6 @@ def get_latest_gamepass_id(user_id):
 
 
 def get_gamepass_info(pass_id):
-    """Вытягивает название паса и Place ID (TargetId) игры."""
     try:
         url = f"https://apis.roblox.com/game-passes/v1/game-passes/{pass_id}/product-info"
         response = http.get(url, timeout=10)
@@ -133,18 +131,15 @@ def get_gamepass_info(pass_id):
 
 
 def check_new_purchases(user_id):
-    """Проверяет появление НОВОГО геймпаса."""
     current_pass_id = get_latest_gamepass_id(user_id)
 
     if not current_pass_id:
         return None
 
-    # При первом запуске просто запоминаем текущий пас, чтобы не спамить прошлыми
     if last_known_pass[user_id] is None:
         last_known_pass[user_id] = current_pass_id
         return None
 
-    # Если появился совершенно новый ID паса
     if current_pass_id != last_known_pass[user_id]:
         last_known_pass[user_id] = current_pass_id
         info = get_gamepass_info(current_pass_id)
@@ -170,7 +165,12 @@ def get_roblox_presences():
 
     response.raise_for_status()
     data = response.json()
-    return data.get("userPresences", [])
+    presences = data.get("userPresences", [])
+
+    # Обязательный лог раз в 15 секунд для отслеживания
+    logger.info("Ответ Roblox Presence API: %s", presences)
+
+    return presences
 
 
 def make_join_link(place_id, game_id=None):
@@ -183,7 +183,7 @@ def make_join_link(place_id, game_id=None):
     if place_id:
         return f"https://www.roblox.com/games/{place_id}"
 
-    return "Ссылка недоступна"
+    return "Ссылка недоступна (Place ID не вычислен)"
 
 
 def update_user_state(presence):
@@ -210,9 +210,12 @@ def update_user_state(presence):
         and old_game_id != game_id
     )
 
+    # Защищенная логика: сохраняем вычисленный place_id, если Roblox отдаёт None
+    current_place_id = place_id if place_id is not None else old_state["place_id"]
+
     last_state[user_id] = {
         "is_playing": is_playing,
-        "place_id": place_id if is_playing else old_state["place_id"],
+        "place_id": current_place_id if is_playing else None,
         "game_id": game_id if is_playing else None,
     }
 
@@ -226,9 +229,8 @@ def update_user_state(presence):
 
 
 def tracker_loop():
-    logger.info("Отслеживание FixPlay и Kaban запущенно")
+    logger.info("Отслеживание FixPlay и Kaban запущено")
 
-    # Первичная инициализация состояния и геймпасов
     try:
         presences = get_roblox_presences()
         for presence in presences:
@@ -253,7 +255,7 @@ def tracker_loop():
 
                 result = update_user_state(presence)
 
-                # 1. Уведомление о входе/смене сервера
+                # 1. Уведомление о входе / смене сервера
                 if result and (result["entered_game"] or result["changed_server"]):
                     name = result["name"]
                     title = "🚨 ЗАШЁЛ В ИГРУ!" if result["entered_game"] else "🔄 СМЕНИЛ СЕРВЕР!"
@@ -268,13 +270,13 @@ def tracker_loop():
                     )
                     send_telegram_message(msg)
 
-                # 2. Проверка покупки геймпаса (для FixPlay)
+                # 2. Проверка покупки нового геймпаса у FixPlay
                 if user_id in OPEN_INVENTORY_USERS and last_state[user_id]["is_playing"]:
                     new_purchase = check_new_purchases(user_id)
 
                     if new_purchase:
                         p_id = new_purchase["place_id"]
-                        last_state[user_id]["place_id"] = p_id  # Запоминаем открытый Place ID
+                        last_state[user_id]["place_id"] = p_id
                         pass_name = new_purchase["pass_name"]
                         name = NAMES_BY_ID[user_id]
 
@@ -331,8 +333,12 @@ def telegram_commands_loop():
 
                     send_telegram_message("\n\n".join(lines), chat_id=chat_id)
 
-        except Exception as error:
+        except requests.RequestException as error:
+            # При дублировании контейнеров во время деплоя ждем 5 секунд
             logger.error("Ошибка Telegram команд: %s", error)
+            time.sleep(5)
+        except Exception as error:
+            logger.error("Непредвиденная ошибка Telegram: %s", error)
             time.sleep(5)
 
 
